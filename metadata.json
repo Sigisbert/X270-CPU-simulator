@@ -1,0 +1,5 @@
+{
+  "name": "X270 CPU Simulator",
+  "description": "A technical simulation of BGA 1356 CPU behavior in the ThinkPad X270 chassis across various workload scenarios.",
+  "requestFramePermissions": []
+}
