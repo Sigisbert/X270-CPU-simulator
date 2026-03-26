@@ -512,7 +512,7 @@ export default function App() {
           
           const fanAirflowFactor = Math.max(0, Math.min(1.0, (currentTemp - 45) / 35.0)); 
           const airflowCoolingBenefit = 1.0 - (fanAirflowFactor * 0.45); 
-          const vrmThetaJA = 22 * airflowCoolingBenefit / coolingBonus;
+          const vrmThetaJA = 22 * airflowCoolingBenefit / Math.pow(coolingBonus, 1.5);
           const vrmSteadyState = VRM_AMBIENT + (vrmPowerLoss * vrmThetaJA);
           vrmTemp = vrmTemp + (vrmSteadyState - vrmTemp) * 0.02;
           
@@ -676,6 +676,7 @@ export default function App() {
     if (coolingSolution === 'airjet') {
       const inverseTotal = (1 / R_STOCK) + (airjetCount / R_AIRJET);
       currentThermalResistance = 1 / inverseTotal;
+      coolingBonus = R_STOCK / currentThermalResistance;
     }
     
     const ambientTemp = 35;
@@ -816,10 +817,10 @@ export default function App() {
       // Base ThetaJA is 22 (still air). With max incidental airflow, it drops significantly (e.g., by 45%).
       const airflowCoolingBenefit = 1.0 - (fanAirflowFactor * 0.45); 
       
-      // Apply cooling solution bonus (better fans/mods move more air)
-      const coolingModBonus = (coolingSolution === 'stock' ? 1.0 : 0.85);
-      
-      const vrmThetaJA = PWM_THETA_JA * airflowCoolingBenefit * coolingModBonus; 
+      // Apply cooling solution bonus (better fans/mods move more air directly over VRMs)
+      // We use Math.pow(coolingBonus, 1.5) to ensure the VRM benefits strongly from the upgrade
+      // and offsets the fact that a cooler CPU means slower fan speeds.
+      const vrmThetaJA = PWM_THETA_JA * airflowCoolingBenefit / Math.pow(coolingBonus, 1.5); 
       
       const vrmSteadyState = VRM_AMBIENT + (vrmPowerLoss * vrmThetaJA);
       vrmTemp = vrmTemp + (vrmSteadyState - vrmTemp) * 0.02; // VRM heats up slower than CPU
