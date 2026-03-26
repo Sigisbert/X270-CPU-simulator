@@ -1,5 +1,6 @@
 import React, { useState, useMemo } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
+import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
 import { 
   Cpu, 
   Zap, 
@@ -21,11 +22,16 @@ interface ScenarioResult {
   sustainedFreq: string;
   consumption: string;
   voltage: string;
+  safetyRange: string;
   amperage: number;
   tempRange: string;
   isCrashed: boolean;
+  isThrottled?: boolean;
   crashReason?: string;
   icon: React.ReactNode;
+  targetFreq: number;
+  targetWatts: number;
+  isMixed: boolean;
 }
 
 export default function App() {
@@ -37,13 +43,28 @@ export default function App() {
   const [vccCacheOffset, setVccCacheOffset] = useState(0); // in mV
   const [isSynchronous, setIsSynchronous] = useState(true);
 
-  // Power Limits
+  // Power Limits & XTU
   const [pl1, setPl1] = useState(15); // Long term (W)
   const [pl2, setPl2] = useState(25); // Short term (W)
+  const [iccMax, setIccMax] = useState(32); // Amps
+  const [tau, setTau] = useState(28); // Seconds
+  const [acpiPpcLimit, setAcpiPpcLimit] = useState(100); // % of max freq
 
   // Cooling Mods
   const [coolingSolution, setCoolingSolution] = useState<'stock' | 'delta' | 'heatpipe' | 'hybrid' | 'airjet'>('stock');
   const [airjetCount, setAirjetCount] = useState(1); // 1 to 4
+
+  // Simulation Settings
+  const [simulationScenario, setSimulationScenario] = useState<string>("Dual-Core Workload");
+  const [simulationDuration, setSimulationDuration] = useState<number>(4); // in minutes
+
+  // PWM/VRM Constants (NCP81382)
+  const PWM_CONTINUOUS_LIMIT = 35; // Amps
+  const PWM_PEAK_LIMIT = 70; // Amps (10ms)
+  const PWM_THERMAL_WARNING = 150; // Celsius
+  const PWM_THERMAL_SHUTDOWN = 180; // Celsius
+  const PWM_THETA_JA = 22; // °C/W
+  const CHASSIS_TDP_LIMIT = 15; // Watts
 
   // Dynamic Safety Limits
   const cacheSafetyLimit = useMemo(() => {
@@ -67,15 +88,7 @@ export default function App() {
   }, [selectedCpu, cacheSafetyLimit, coreSafetyLimit]);
 
   // Electrical System Analysis (Top level for UI access)
-  // X270 VRM is designed for ~25A peak (2-phase Core VRM)
-  const vrmLoad = useMemo(() => {
-    const estimatedVoltage = 0.95; // Average operating voltage
-    const currentDrawPL2 = pl2 / estimatedVoltage;
-    // 8th Gen Quad-Cores stress the X270 VRM 40% more than Dual-Cores due to higher switching frequency and IccMax
-    const archMultiplier = selectedCpu.architecture === "Kaby Lake-R" ? 1.4 : 1.0;
-    return (currentDrawPL2 / 25) * 100 * archMultiplier; // % of design limit
-  }, [pl2, selectedCpu]);
-
+  // X270 uses 1x 81382 GEJI (35A) for VCCCPUCORE and 1x 81382 GEJI for VCCGPUCore
   const handleCoreChange = (val: number) => {
     const clamped = Math.max(coreSafetyLimit, val);
     setVccCoreOffset(clamped);
@@ -100,6 +113,7 @@ export default function App() {
 
   const scenarios = useMemo(() => {
     const cpu = selectedCpu;
+    const archMultiplier = cpu.architecture === "Kaby Lake-R" ? 1.4 : 1.0;
     
     // Undervolt impact: 
     // Every -10mV offset allows roughly +0.04 GHz sustained frequency in TDP-limited scenarios
@@ -141,14 +155,17 @@ export default function App() {
 
     const calculateThermalThrottle = (targetWatts: number) => {
       const uvReduction = (Math.abs(vccCoreOffset) * 0.06); // 6C reduction per 100mV
-      const potentialTemp = ambientTemp + (targetWatts * currentThermalResistance) - uvReduction;
+      // Improved thermal model: 
+      // Account for chassis saturation (CHASSIS_TDP_LIMIT)
+      const saturationPenalty = targetWatts > CHASSIS_TDP_LIMIT ? (targetWatts - CHASSIS_TDP_LIMIT) * 0.5 : 0;
+      const potentialTemp = ambientTemp + (targetWatts * currentThermalResistance) + saturationPenalty - uvReduction;
       
       if (potentialTemp > TJUNCTION) {
         // Calculate how much we need to throttle to stay at TJUNCTION
-        const allowedRise = TJUNCTION - ambientTemp + uvReduction;
+        const allowedRise = TJUNCTION - ambientTemp + uvReduction - saturationPenalty;
         const throttledWatts = allowedRise / currentThermalResistance;
         return {
-          throttleFactor: Math.max(0.4, throttledWatts / targetWatts),
+          throttleFactor: Math.max(0.3, throttledWatts / targetWatts),
           finalTemp: TJUNCTION,
           isThrottling: true
         };
@@ -161,21 +178,8 @@ export default function App() {
       };
     };
 
-    const checkCrash = (workloadFactor: number, voltageStr: string, watts: number) => {
-      const coreOff = Math.abs(vccCoreOffset);
-      const cacheOff = Math.abs(vccCacheOffset);
-      const weightedOff = (coreOff * 0.25) + (cacheOff * 0.75);
-      const tolerance = 1.0;
-      const vrmStress = cpu.architecture === "Kaby Lake-R" ? 1.4 : 1.0;
-      const chassisPenalty = cpu.cores > 2 ? 1.2 : 1.0;
-      const pl2Penalty = Math.max(0, (pl2 - 15) * 0.05 * vrmStress);
-      
-      const penalty = (weightedOff / (2.8 * tolerance)) * workloadFactor * chassisPenalty * vrmStress + pl2Penalty;
-      const syncBonus = isSynchronous ? 5 : 0;
-      const stabilityScore = 100 - penalty + syncBonus;
-
+    const checkCrash = (workloadFactor: number, voltageStr: string, watts: number, amperage: number, isBurst: boolean) => {
       const voltage = parseFloat(voltageStr);
-      const currentAmperage = watts / voltage;
       
       let reason = "";
       let isCrashed = false;
@@ -183,17 +187,17 @@ export default function App() {
       // Architecture specific voltage underrun limits
       let minVoltage = 0.640; // Default Kaby Lake
       if (cpu.architecture === "Skylake") minVoltage = 0.660;
-      if (cpu.architecture === "Kaby Lake-R") minVoltage = 0.620;
+      if (cpu.architecture === "Kaby Lake-R") minVoltage = 0.530;
 
-      if (stabilityScore < 60) {
-        isCrashed = true;
-        reason = "Instability (UV/Load)";
-      } else if (voltage < minVoltage) {
+      if (voltage < minVoltage) {
         isCrashed = true;
         reason = "Voltage Underrun";
-      } else if (currentAmperage > 32.5) {
+      } else if (amperage > PWM_PEAK_LIMIT) {
         isCrashed = true;
-        reason = "VRM OCP Shutdown";
+        reason = `VRM Instant OCP (>${PWM_PEAK_LIMIT}A)`;
+      } else if (amperage > PWM_CONTINUOUS_LIMIT && !isBurst) {
+        isCrashed = true;
+        reason = `VRM Overload (>${PWM_CONTINUOUS_LIMIT}A sustained)`;
       }
 
       return { isCrashed, reason };
@@ -206,11 +210,6 @@ export default function App() {
       
       if (isBurst && !isThrottling) return `${min}°C - ${Math.min(97, max + 5)}°C`;
       return `${min}°C - ${max}°C`;
-    };
-
-    const getThrottledFreq = (baseFreq: number, watts: number) => {
-      const { throttleFactor } = calculateThermalThrottle(watts);
-      return (baseFreq * throttleFactor).toFixed(2);
     };
 
     const calculateOperatingVoltage = (freqGhz: number, watts: number, tempStr: string) => {
@@ -232,208 +231,631 @@ export default function App() {
       return `${finalV.toFixed(3)} V`;
     };
 
+    const getSafetyVoltageRange = (freqGhz: number) => {
+      let baseVAt800 = 0.650;
+      let minStableOffset = -0.130;
+      let absoluteMax = 1.350;
+
+      if (cpu.architecture === "Skylake") {
+        baseVAt800 = 0.670;
+        minStableOffset = -0.150;
+        absoluteMax = 1.350;
+      } else if (cpu.architecture === "Kaby Lake-R") {
+        baseVAt800 = 0.630;
+        minStableOffset = -0.115;
+        absoluteMax = 1.300;
+      }
+
+      const baseV = baseVAt800 + (freqGhz - 0.8) * 0.171;
+      const minV = baseV + minStableOffset;
+      
+      return `[${minV.toFixed(3)}V - ${absoluteMax.toFixed(3)}V]`;
+    };
+
+    const simulateWorkload = (targetFreq: number, targetWatts: number, isBurst: boolean, isMixed: boolean = false) => {
+      // 1. ACPI/UEFI Constraint
+      const acpiFreq = targetFreq * (acpiPpcLimit / 100);
+
+      let currentWatts = targetWatts;
+      
+      // 2. Thermal Throttle
+      const { throttleFactor } = calculateThermalThrottle(currentWatts);
+      let currentFreq = acpiFreq * throttleFactor;
+      
+      // 3. IccMax Throttle
+      let tempStr = getTempRange(currentWatts, isBurst);
+      let voltage = parseFloat(calculateOperatingVoltage(currentFreq, currentWatts, tempStr));
+      
+      // Split power for separate VRMs if mixed load
+      const cpuPowerRatio = isMixed ? 0.7 : 1.0;
+      const gpuPowerRatio = isMixed ? 0.3 : 0.0;
+      
+      let cpuAmperage = ((currentWatts * cpuPowerRatio) / voltage) * archMultiplier;
+      let gpuAmperage = ((currentWatts * gpuPowerRatio) / voltage) * archMultiplier;
+      
+      // Check OCP for both VRMs
+      const CPU_VRM_LIMIT = PWM_CONTINUOUS_LIMIT;
+      const GPU_VRM_LIMIT = PWM_CONTINUOUS_LIMIT;
+      
+      if (cpuAmperage > iccMax || gpuAmperage > GPU_VRM_LIMIT) {
+        // Iterate slightly to find the stable point
+        for (let i = 0; i < 3; i++) {
+          const cpuThrottle = iccMax / cpuAmperage;
+          const gpuThrottle = GPU_VRM_LIMIT / gpuAmperage;
+          const throttle = Math.min(cpuThrottle, gpuThrottle);
+          
+          if (throttle >= 1) break;
+          
+          currentWatts *= throttle;
+          currentFreq *= throttle;
+          tempStr = getTempRange(currentWatts, isBurst);
+          voltage = parseFloat(calculateOperatingVoltage(currentFreq, currentWatts, tempStr));
+          cpuAmperage = ((currentWatts * cpuPowerRatio) / voltage) * archMultiplier;
+          gpuAmperage = ((currentWatts * gpuPowerRatio) / voltage) * archMultiplier;
+        }
+      }
+      
+      return {
+        freq: currentFreq,
+        watts: currentWatts,
+        voltage: voltage.toFixed(3) + " V",
+        amperage: Math.max(cpuAmperage, gpuAmperage), // Return max load for OCP display
+        tempStr,
+        isThrottled: cpuAmperage >= iccMax - 0.2 || gpuAmperage >= GPU_VRM_LIMIT - 0.5 || cpuAmperage >= PWM_PEAK_LIMIT - 0.5
+      };
+    };
+
     const results: ScenarioResult[] = [];
       {
-        const idleV = calculateOperatingVoltage(0.8, 1.2, getTempRange(1.2, false));
-        const idleCrash = checkCrash(0.05, idleV, 1.2);
+        const idleFreq = 0.8;
+        const sim = simulateWorkload(idleFreq, 1.2, false);
+        const idleCrash = checkCrash(0.05, sim.voltage, sim.watts, sim.amperage, false);
         results.push({
           name: "Idle",
           description: "System at rest, background tasks only.",
           maxFreq: "0.80 GHz",
           sustainedFreq: "0.80 GHz",
-          consumption: "0.8 - 1.5 W",
-          tempRange: getTempRange(1.2, false),
-          voltage: idleV,
-          amperage: 1.2 / parseFloat(idleV),
+          consumption: `${sim.watts.toFixed(1)} W`,
+          tempRange: sim.tempStr,
+          voltage: sim.voltage,
+          safetyRange: getSafetyVoltageRange(idleFreq),
+          amperage: sim.amperage,
           isCrashed: idleCrash.isCrashed,
+          isThrottled: sim.isThrottled,
           crashReason: idleCrash.reason,
-          icon: <Battery className="w-5 h-5 text-green-500" />
+          icon: <Battery className="w-5 h-5 text-green-500" />,
+          targetFreq: idleFreq,
+          targetWatts: 1.2,
+          isMixed: false
         });
       }
       {
         const p1c = Math.min(pl2, powerReq1Core);
-        const v1c = calculateOperatingVoltage(
-          parseFloat(getThrottledFreq(cpu.maxTurbo * burst1CoreThrottle, p1c)), 
-          p1c, 
-          getTempRange(p1c, true)
-        );
-        const crash1c = checkCrash(0.35, v1c, p1c);
+        const sim = simulateWorkload(cpu.maxTurbo * burst1CoreThrottle, p1c, true);
+        const crash1c = checkCrash(0.35, sim.voltage, sim.watts, sim.amperage, true);
+        const tauFactor = 0.5 + 0.5 * Math.min(1, tau / 28);
+        const susSim = simulateWorkload(cpu.maxTurbo * 0.95 * burst1CoreThrottle, p1c, true);
+        
         results.push({
           name: "1 Core Burst",
           description: "Single-threaded peak performance.",
-          maxFreq: `${getThrottledFreq(cpu.maxTurbo * burst1CoreThrottle, p1c)} GHz`,
-          sustainedFreq: `${getThrottledFreq(cpu.maxTurbo * 0.95 * burst1CoreThrottle, p1c)} GHz`,
-          consumption: `${p1c.toFixed(1)} W`,
-          tempRange: getTempRange(p1c, true),
-          voltage: v1c,
-          amperage: p1c / parseFloat(v1c),
+          maxFreq: `${sim.freq.toFixed(2)} GHz`,
+          sustainedFreq: `${(susSim.freq * tauFactor).toFixed(2)} GHz`,
+          consumption: `${sim.watts.toFixed(1)} W`,
+          tempRange: sim.tempStr,
+          voltage: sim.voltage,
+          safetyRange: getSafetyVoltageRange(sim.freq),
+          amperage: sim.amperage,
           isCrashed: crash1c.isCrashed,
+          isThrottled: sim.isThrottled,
           crashReason: crash1c.reason,
-          icon: <Zap className="w-5 h-5 text-yellow-500" />
+          icon: <Zap className="w-5 h-5 text-yellow-500" />,
+          targetFreq: cpu.maxTurbo * burst1CoreThrottle,
+          targetWatts: p1c,
+          isMixed: false
         });
       }
       {
         const pac = Math.min(pl2, powerReqAllCore);
-        const vac = calculateOperatingVoltage(
-          parseFloat(getThrottledFreq(cpu.allCoreTurbo * burstAllCoreThrottle, pac)),
-          pac,
-          getTempRange(pac, true)
-        );
-        const crashAc = checkCrash(0.6, vac, pac);
+        const sim = simulateWorkload(cpu.allCoreTurbo * burstAllCoreThrottle, pac, true);
+        const crashAc = checkCrash(0.6, sim.voltage, sim.watts, sim.amperage, true);
+        const tauFactor = 0.5 + 0.5 * Math.min(1, tau / 28);
+        const susSim = simulateWorkload(cpu.allCoreTurbo * 0.85 * burstAllCoreThrottle, pac, true);
         results.push({
           name: "Dual-Core Workload",
           description: "Multi-threaded burst performance.",
-          maxFreq: `${getThrottledFreq(cpu.allCoreTurbo * burstAllCoreThrottle, pac)} GHz`,
-          sustainedFreq: `${getThrottledFreq(cpu.allCoreTurbo * 0.85 * burstAllCoreThrottle, pac)} GHz`,
-          consumption: `${pac.toFixed(1)} W`,
-          tempRange: getTempRange(pac, true),
-          voltage: vac,
-          amperage: pac / parseFloat(vac),
+          maxFreq: `${sim.freq.toFixed(2)} GHz`,
+          sustainedFreq: `${(susSim.freq * tauFactor).toFixed(2)} GHz`,
+          consumption: `${sim.watts.toFixed(1)} W`,
+          tempRange: sim.tempStr,
+          voltage: sim.voltage,
+          safetyRange: getSafetyVoltageRange(sim.freq),
+          amperage: sim.amperage,
           isCrashed: crashAc.isCrashed,
+          isThrottled: sim.isThrottled,
           crashReason: crashAc.reason,
-          icon: <Activity className="w-5 h-5 text-blue-500" />
+          icon: <Activity className="w-5 h-5 text-blue-500" />,
+          targetFreq: cpu.allCoreTurbo * burstAllCoreThrottle,
+          targetWatts: pac,
+          isMixed: false
         });
       }
       {
-        const vsus = calculateOperatingVoltage(
-          parseFloat(getThrottledFreq(Math.min(cpu.allCoreTurbo, ((cpu.cores > 2 
+        const freqSus = Math.min(cpu.allCoreTurbo, ((cpu.cores > 2 
             ? Math.max(cpu.baseFreq * 0.75, 1.4) 
-            : Math.min(cpu.allCoreTurbo, cpu.baseFreq + 0.2)) * (pl1/15)) + totalBoost), pl1)),
-          pl1,
-          getTempRange(pl1, false)
-        );
-        const crashSus = checkCrash(0.85, vsus, pl1);
+            : Math.min(cpu.allCoreTurbo, cpu.baseFreq + 0.2)) * (pl1/15)) + totalBoost);
+        const sim = simulateWorkload(freqSus, pl1, false);
+        const crashSus = checkCrash(0.85, sim.voltage, sim.watts, sim.amperage, false);
+        const maxSim = simulateWorkload(cpu.allCoreTurbo * burstAllCoreThrottle, pl1, true);
         results.push({
           name: `${cpu.cores} Core Sustained`,
           description: `Long-term heavy load limited by ${pl1}W TDP.`,
-          maxFreq: `${getThrottledFreq(cpu.allCoreTurbo * burstAllCoreThrottle, pl1)} GHz`,
-          sustainedFreq: `${getThrottledFreq(Math.min(cpu.allCoreTurbo, ((cpu.cores > 2 
-            ? Math.max(cpu.baseFreq * 0.75, 1.4) 
-            : Math.min(cpu.allCoreTurbo, cpu.baseFreq + 0.2)) * (pl1/15)) + totalBoost), pl1)} GHz`,
-          consumption: `${pl1.toFixed(1)} W (Locked)`,
-          tempRange: getTempRange(pl1, false),
-          voltage: vsus,
-          amperage: pl1 / parseFloat(vsus),
+          maxFreq: `${maxSim.freq.toFixed(2)} GHz`,
+          sustainedFreq: `${sim.freq.toFixed(2)} GHz`,
+          consumption: `${sim.watts.toFixed(1)} W (Locked)`,
+          tempRange: sim.tempStr,
+          voltage: sim.voltage,
+          safetyRange: getSafetyVoltageRange(sim.freq),
+          amperage: sim.amperage,
           isCrashed: crashSus.isCrashed,
+          isThrottled: sim.isThrottled,
           crashReason: crashSus.reason,
-          icon: <Wind className="w-5 h-5 text-cyan-500" />
+          icon: <Wind className="w-5 h-5 text-cyan-500" />,
+          targetFreq: freqSus,
+          targetWatts: pl1,
+          isMixed: false
         });
       }
       {
         const pMixed = pl1 * 1.2;
-        const vMixed = calculateOperatingVoltage(
-          parseFloat(getThrottledFreq(((cpu.baseFreq * 0.8) * (pl1/15)) + totalBoost * 0.5, pMixed)),
-          pMixed,
-          getTempRange(pMixed, false)
-        );
-        const crashMixed = checkCrash(0.95, vMixed, pMixed);
+        const freqMixed = ((cpu.baseFreq * 0.8) * (pl1/15)) + totalBoost * 0.5;
+        
+        // Run a mini-simulation to get dynamic results for the table
+        let totalWatts = 0;
+        let totalFreq = 0;
+        let maxTemp = 40;
+        let maxWatts = 0;
+        let maxFreq = 0;
+        let isThrottled = false;
+        let isCrashed = false;
+        let crashReason = "";
+        
+        let currentTemp = 40;
+        let vrmTemp = 45;
+        let burstTimer = 0;
+        let currentBurstMultiplier = 1.0;
+        
+        const R_STOCK = 3.2;
+        const R_AIRJET = 8.0;
+        let currentThermalResistance = R_STOCK / coolingBonus;
+        if (coolingSolution === 'airjet') {
+          const inverseTotal = (1 / R_STOCK) + (airjetCount / R_AIRJET);
+          currentThermalResistance = 1 / inverseTotal;
+        }
+        
+        const uvReduction = (Math.abs(vccCoreOffset) * 0.06);
+        const ambientTemp = 35;
+        const TJUNCTION = 97;
+        const CHASSIS_TDP_LIMIT = 15;
+        const VRM_AMBIENT = 40;
+        
+        for (let t = 0; t <= 60; t++) {
+          let currentLimit = t <= tau ? pl2 : pl1;
+          if (vrmTemp > PWM_THERMAL_WARNING) {
+            currentLimit = Math.min(currentLimit, pl1);
+          }
+          
+          let targetWatts = Math.min(currentLimit, pMixed);
+          let targetFreq = freqMixed * (acpiPpcLimit / 100);
+          
+          if (burstTimer > 0) {
+            burstTimer--;
+            if (vrmTemp <= PWM_THERMAL_WARNING) {
+              currentLimit = pl2;
+            }
+            targetWatts = pl2 * currentBurstMultiplier;
+            targetFreq = cpu.maxTurbo * currentBurstMultiplier;
+          } else {
+            if (Math.random() < 0.03) {
+              burstTimer = Math.floor(Math.random() * 4) + 2;
+              currentBurstMultiplier = 0.85 + Math.random() * 0.15;
+            }
+            const wave1 = Math.sin(t / 3.1) * 0.10;
+            const wave2 = Math.sin(t / 7.3) * 0.15;
+            const wave3 = Math.sin(t / 11.7) * 0.05;
+            const jitter = (Math.random() - 0.5) * 0.20;
+            const noiseFactor = 1.0 + wave1 + wave2 + wave3 + jitter;
+            targetWatts = pMixed * noiseFactor;
+            targetFreq = freqMixed * noiseFactor;
+          }
+          
+          targetWatts = Math.min(currentLimit, Math.max(3, targetWatts));
+          targetFreq = Math.min(cpu.maxTurbo, Math.max(0.8, targetFreq));
+          
+          const saturationPenalty = targetWatts > CHASSIS_TDP_LIMIT ? (targetWatts - CHASSIS_TDP_LIMIT) * 0.5 : 0;
+          const steadyStateTemp = ambientTemp + (targetWatts * currentThermalResistance) + saturationPenalty - uvReduction;
+          currentTemp = currentTemp + (steadyStateTemp - currentTemp) * 0.05;
+          
+          let actualWatts = targetWatts;
+          let actualFreq = targetFreq;
+          
+          if (currentTemp > TJUNCTION) {
+            currentTemp = TJUNCTION;
+            const allowedRise = TJUNCTION - ambientTemp + uvReduction - saturationPenalty;
+            actualWatts = allowedRise / currentThermalResistance;
+            const throttleFactor = Math.max(0.3, actualWatts / targetWatts);
+            actualFreq = targetFreq * throttleFactor;
+            isThrottled = true;
+          }
+          
+          let baseVAt800 = 0.650;
+          if (cpu.architecture === "Skylake") baseVAt800 = 0.670;
+          if (cpu.architecture === "Kaby Lake-R") baseVAt800 = 0.630;
+          const baseV = baseVAt800 + (actualFreq - 0.8) * 0.171;
+          const tempAdjustment = Math.max(0, (currentTemp - 50) * 0.0008);
+          const vDroop = (actualWatts * 0.0012);
+          const voltage = baseV + (vccCoreOffset / 1000) + tempAdjustment - vDroop;
+          
+          let amperage = (actualWatts / voltage) * archMultiplier;
+          if (amperage > iccMax) {
+            const throttle = iccMax / amperage;
+            actualWatts *= throttle;
+            actualFreq *= throttle;
+            amperage = iccMax;
+            isThrottled = true;
+          }
+          
+          const baseEfficiency = Math.max(0.65, 0.92 - Math.pow(amperage / 35, 2) * 0.15);
+          const tempPenalty = Math.max(0, (vrmTemp - 80) * 0.002);
+          const efficiency = Math.max(0.5, baseEfficiency - tempPenalty);
+          const vrmPowerLoss = actualWatts * ((1 / efficiency) - 1);
+          
+          const fanAirflowFactor = Math.max(0, Math.min(1.0, (currentTemp - 45) / 35.0)); 
+          const airflowCoolingBenefit = 1.0 - (fanAirflowFactor * 0.45); 
+          const vrmThetaJA = 22 * airflowCoolingBenefit / coolingBonus;
+          const vrmSteadyState = VRM_AMBIENT + (vrmPowerLoss * vrmThetaJA);
+          vrmTemp = vrmTemp + (vrmSteadyState - vrmTemp) * 0.02;
+          
+          const crashCheck = checkCrash(0.95, voltage.toFixed(3) + " V", actualWatts, amperage, false);
+          if (crashCheck.isCrashed) {
+            isCrashed = true;
+            crashReason = crashCheck.reason;
+          }
+          
+          totalWatts += actualWatts;
+          totalFreq += actualFreq;
+          maxWatts = Math.max(maxWatts, actualWatts);
+          maxFreq = Math.max(maxFreq, actualFreq);
+          maxTemp = Math.max(maxTemp, currentTemp);
+        }
+        
+        const avgWatts = totalWatts / 61;
+        const avgFreq = totalFreq / 61;
+        
+        // Use the static simulator just to format the voltage/amperage for the average state
+        const sim = simulateWorkload(avgFreq, avgWatts, false, true);
+        
         results.push({
           name: "Mixed High TDP",
           description: "CPU + iGPU heavy load (e.g. video rendering).",
-          maxFreq: `${getThrottledFreq(cpu.allCoreTurbo * 0.8 * burstAllCoreThrottle, pMixed)} GHz`,
-          sustainedFreq: `${getThrottledFreq(((cpu.baseFreq * 0.8) * (pl1/15)) + totalBoost * 0.5, pMixed)} GHz`,
-          consumption: `${pl1.toFixed(1) } W (Shared)`,
-          tempRange: getTempRange(pMixed, false),
-          voltage: vMixed,
-          amperage: pMixed / parseFloat(vMixed),
-          isCrashed: crashMixed.isCrashed,
-          crashReason: crashMixed.reason,
-          icon: <Thermometer className="w-5 h-5 text-red-500" />
+          maxFreq: `${maxFreq.toFixed(2)} GHz`,
+          sustainedFreq: `~${avgFreq.toFixed(2)} GHz (Avg)`,
+          consumption: `~${avgWatts.toFixed(1)} W (Avg)`,
+          tempRange: `40°C - ${Math.round(maxTemp)}°C`,
+          voltage: sim.voltage,
+          safetyRange: getSafetyVoltageRange(avgFreq),
+          amperage: sim.amperage,
+          isCrashed: isCrashed,
+          isThrottled: isThrottled,
+          crashReason: crashReason,
+          icon: <Thermometer className="w-5 h-5 text-red-500" />,
+          targetFreq: freqMixed,
+          targetWatts: pMixed,
+          isMixed: true
         });
       }
       {
         const p4b = Math.min(pl2, powerReqAllCore * 1.05);
-        const v4b = calculateOperatingVoltage(
-          parseFloat(getThrottledFreq(cpu.allCoreTurbo * burstAllCoreThrottle, p4b)), 
-          p4b, 
-          getTempRange(p4b, true)
-        );
-        const crash4b = checkCrash(0.7, v4b, p4b);
+        const sim = simulateWorkload(cpu.allCoreTurbo * burstAllCoreThrottle, p4b, true);
+        const crash4b = checkCrash(0.7, sim.voltage, sim.watts, sim.amperage, true);
+        const tauFactor = 0.5 + 0.5 * Math.min(1, tau / 28);
+        const susSim = simulateWorkload(cpu.allCoreTurbo * 0.8 * burstAllCoreThrottle, p4b, true);
         results.push({
           name: "4 Threads Burst",
           description: "High-intensity short-term workload on 4 logical cores.",
-          maxFreq: `${getThrottledFreq(cpu.allCoreTurbo * burstAllCoreThrottle, p4b)} GHz`,
-          sustainedFreq: `${getThrottledFreq(cpu.allCoreTurbo * 0.8 * burstAllCoreThrottle, p4b)} GHz`,
-          consumption: `${p4b.toFixed(1)} W`,
-          tempRange: getTempRange(p4b, true),
-          voltage: v4b,
-          amperage: p4b / parseFloat(v4b),
+          maxFreq: `${sim.freq.toFixed(2)} GHz`,
+          sustainedFreq: `${(susSim.freq * tauFactor).toFixed(2)} GHz`,
+          consumption: `${sim.watts.toFixed(1)} W`,
+          tempRange: sim.tempStr,
+          voltage: sim.voltage,
+          safetyRange: getSafetyVoltageRange(sim.freq),
+          amperage: sim.amperage,
           isCrashed: crash4b.isCrashed,
+          isThrottled: sim.isThrottled,
           crashReason: crash4b.reason,
-          icon: <Activity className="w-5 h-5 text-indigo-500" />
+          icon: <Activity className="w-5 h-5 text-indigo-500" />,
+          targetFreq: cpu.allCoreTurbo * burstAllCoreThrottle,
+          targetWatts: p4b,
+          isMixed: false
         });
       }
       {
-        const v4s = calculateOperatingVoltage(
-          parseFloat(getThrottledFreq(Math.min(cpu.allCoreTurbo, ((cpu.cores > 2 ? cpu.baseFreq : cpu.baseFreq - 0.2) * (pl1/15)) + totalBoost), pl1)), 
-          pl1, 
-          getTempRange(pl1, false)
-        );
-        const crash4s = checkCrash(0.8, v4s, pl1);
+        const freq4s = Math.min(cpu.allCoreTurbo, ((cpu.cores > 2 ? cpu.baseFreq : cpu.baseFreq - 0.2) * (pl1/15)) + totalBoost);
+        const sim = simulateWorkload(freq4s, pl1, false);
+        const crash4s = checkCrash(0.8, sim.voltage, sim.watts, sim.amperage, false);
+        const maxSim = simulateWorkload(cpu.allCoreTurbo * burstAllCoreThrottle, pl1, true);
         results.push({
           name: "4 Threads Sustained",
           description: "Continuous multi-threaded load (e.g. compiling).",
-          maxFreq: `${getThrottledFreq(cpu.allCoreTurbo * burstAllCoreThrottle, pl1)} GHz`,
-          sustainedFreq: `${getThrottledFreq(Math.min(cpu.allCoreTurbo, ((cpu.cores > 2 ? cpu.baseFreq : cpu.baseFreq - 0.2) * (pl1/15)) + totalBoost), pl1)} GHz`,
-          consumption: `${pl1.toFixed(1)} W`,
-          tempRange: getTempRange(pl1, false),
-          voltage: v4s,
-          amperage: pl1 / parseFloat(v4s),
+          maxFreq: `${maxSim.freq.toFixed(2)} GHz`,
+          sustainedFreq: `${sim.freq.toFixed(2)} GHz`,
+          consumption: `${sim.watts.toFixed(1)} W`,
+          tempRange: sim.tempStr,
+          voltage: sim.voltage,
+          safetyRange: getSafetyVoltageRange(sim.freq),
+          amperage: sim.amperage,
           isCrashed: crash4s.isCrashed,
+          isThrottled: sim.isThrottled,
           crashReason: crash4s.reason,
-          icon: <Wind className="w-5 h-5 text-indigo-400" />
+          icon: <Wind className="w-5 h-5 text-indigo-400" />,
+          targetFreq: freq4s,
+          targetWatts: pl1,
+          isMixed: false
         });
       }
       {
         const p8b = Math.min(pl2, powerReqAllCore * 1.2);
-        const v8b = calculateOperatingVoltage(
-          parseFloat(getThrottledFreq(cpu.allCoreTurbo * 0.9 * burstAllCoreThrottle, p8b)), 
-          p8b, 
-          getTempRange(p8b, true)
-        );
-        const crash8b = checkCrash(0.9, v8b, p8b);
+        const sim = simulateWorkload(cpu.allCoreTurbo * 0.9 * burstAllCoreThrottle, p8b, true);
+        const crash8b = checkCrash(0.9, sim.voltage, sim.watts, sim.amperage, true);
+        const tauFactor = 0.5 + 0.5 * Math.min(1, tau / 28);
+        const susSim = simulateWorkload(cpu.allCoreTurbo * 0.7 * burstAllCoreThrottle, p8b, true);
         results.push({
           name: "8 Threads Burst",
           description: "Maximum logical core saturation (Burst).",
-          maxFreq: `${getThrottledFreq(cpu.allCoreTurbo * 0.9 * burstAllCoreThrottle, p8b)} GHz`,
-          sustainedFreq: `${getThrottledFreq(cpu.allCoreTurbo * 0.7 * burstAllCoreThrottle, p8b)} GHz`,
-          consumption: `${p8b.toFixed(1)} W`,
-          tempRange: getTempRange(p8b, true),
-          voltage: v8b,
-          amperage: p8b / parseFloat(v8b),
+          maxFreq: `${sim.freq.toFixed(2)} GHz`,
+          sustainedFreq: `${(susSim.freq * tauFactor).toFixed(2)} GHz`,
+          consumption: `${sim.watts.toFixed(1)} W`,
+          tempRange: sim.tempStr,
+          voltage: sim.voltage,
+          safetyRange: getSafetyVoltageRange(sim.freq),
+          amperage: sim.amperage,
           isCrashed: crash8b.isCrashed,
+          isThrottled: sim.isThrottled,
           crashReason: crash8b.reason,
-          icon: <Zap className="w-5 h-5 text-purple-500" />
+          icon: <Zap className="w-5 h-5 text-purple-500" />,
+          targetFreq: cpu.allCoreTurbo * 0.9 * burstAllCoreThrottle,
+          targetWatts: p8b,
+          isMixed: false
         });
       }
       {
-        const v8s = calculateOperatingVoltage(
-          parseFloat(getThrottledFreq(Math.min(cpu.allCoreTurbo, ((cpu.cores > 2 ? cpu.baseFreq * 0.8 : cpu.baseFreq * 0.6) * (pl1/15)) + totalBoost), pl1)), 
-          pl1, 
-          getTempRange(pl1, false)
-        );
-        const crash8s = checkCrash(1.0, v8s, pl1);
+        const freq8s = Math.min(cpu.allCoreTurbo, ((cpu.cores > 2 ? cpu.baseFreq * 0.8 : cpu.baseFreq * 0.6) * (pl1/15)) + totalBoost);
+        const sim = simulateWorkload(freq8s, pl1, false);
+        const crash8s = checkCrash(1.0, sim.voltage, sim.watts, sim.amperage, false);
+        const maxSim = simulateWorkload(cpu.allCoreTurbo * 0.8 * burstAllCoreThrottle, pl1, true);
         results.push({
           name: "8 Threads Sustained",
           description: "Maximum logical core saturation (Sustained).",
-          maxFreq: `${getThrottledFreq(cpu.allCoreTurbo * 0.8 * burstAllCoreThrottle, pl1)} GHz`,
-          sustainedFreq: `${getThrottledFreq(Math.min(cpu.allCoreTurbo, ((cpu.cores > 2 ? cpu.baseFreq * 0.8 : cpu.baseFreq * 0.6) * (pl1/15)) + totalBoost), pl1)} GHz`,
-          consumption: `${pl1.toFixed(1)} W`,
-          tempRange: getTempRange(pl1, false),
-          voltage: v8s,
-          amperage: pl1 / parseFloat(v8s),
+          maxFreq: `${maxSim.freq.toFixed(2)} GHz`,
+          sustainedFreq: `${sim.freq.toFixed(2)} GHz`,
+          consumption: `${sim.watts.toFixed(1)} W`,
+          tempRange: sim.tempStr,
+          voltage: sim.voltage,
+          safetyRange: getSafetyVoltageRange(sim.freq),
+          amperage: sim.amperage,
           isCrashed: crash8s.isCrashed,
+          isThrottled: sim.isThrottled,
           crashReason: crash8s.reason,
-          icon: <Wind className="w-5 h-5 text-purple-400" />
+          icon: <Wind className="w-5 h-5 text-purple-400" />,
+          targetFreq: freq8s,
+          targetWatts: pl1,
+          isMixed: false
         });
       }
 
     return results;
-  }, [selectedCpu, vccCoreOffset, vccCacheOffset, pl1, pl2, coolingSolution, airjetCount, isSynchronous]);
+  }, [selectedCpu, vccCoreOffset, vccCacheOffset, pl1, pl2, iccMax, tau, coolingSolution, airjetCount, isSynchronous, acpiPpcLimit]);
+
+  const stressTestData = useMemo(() => {
+    const data = [];
+    const cpu = selectedCpu;
+    const archMultiplier = cpu.architecture === "Kaby Lake-R" ? 1.4 : 1.0;
+    
+    // Find the selected scenario
+    const scenario = scenarios.find(s => s.name === simulationScenario) || scenarios[0];
+    
+    // Cooling calculations
+    let coolingBonus = 1.0;
+    if (coolingSolution === 'delta') coolingBonus = 1.15;
+    if (coolingSolution === 'heatpipe') coolingBonus = 1.20;
+    if (coolingSolution === 'hybrid') coolingBonus = 1.35;
+    
+    const R_STOCK = 3.2;
+    const R_AIRJET = 8.0;
+    let currentThermalResistance = R_STOCK / coolingBonus;
+    if (coolingSolution === 'airjet') {
+      const inverseTotal = (1 / R_STOCK) + (airjetCount / R_AIRJET);
+      currentThermalResistance = 1 / inverseTotal;
+    }
+    
+    const ambientTemp = 35;
+    const TJUNCTION = 97;
+    const CHASSIS_TDP_LIMIT = 15;
+    
+    const uvReduction = (Math.abs(vccCoreOffset) * 0.06);
+    
+    let currentTemp = 40; // Start at 40C
+    let vrmTemp = 45; // VRM starts at 45C
+    const VRM_AMBIENT = 40;
+    
+    const durationSeconds = simulationDuration * 60;
+    // To keep the graph performant, we'll sample data points based on duration
+    const step = Math.max(1, Math.floor(durationSeconds / 120)); 
+    
+    let isVrmShutdown = false;
+    let burstTimer = 0;
+    let currentBurstMultiplier = 1.0;
+
+    for (let t = 0; t <= durationSeconds; t++) {
+      if (isVrmShutdown) {
+        if (t % step === 0 || t === durationSeconds) {
+          data.push({
+            time: t,
+            temperature: Math.round(currentTemp),
+            vrmTemp: Math.round(vrmTemp),
+            power: 0,
+            frequency: 0,
+          });
+        }
+        // Cool down
+        currentTemp = currentTemp + (ambientTemp - currentTemp) * 0.05;
+        vrmTemp = vrmTemp + (VRM_AMBIENT - vrmTemp) * 0.1;
+        continue;
+      }
+
+      // Determine power limit for this second
+      let currentLimit = t <= tau ? pl2 : pl1;
+      
+      // Motherboard PROCHOT / VRM Thermal Warning response
+      if (vrmTemp > PWM_THERMAL_WARNING) {
+        currentLimit = Math.min(currentLimit, pl1); // Force PL1 if VRM is overheating
+      }
+      
+      // The CPU wants to draw targetWatts to hit targetFreq
+      let targetWatts = Math.min(currentLimit, scenario.targetWatts);
+      let targetFreq = scenario.targetFreq;
+      
+      // ACPI Constraint
+      targetFreq = targetFreq * (acpiPpcLimit / 100);
+      
+      // Add randomness for mixed workloads
+      if (scenario.isMixed) {
+        // Handle burst charges (sudden spikes to PL2)
+        if (burstTimer > 0) {
+          burstTimer--;
+          // Override currentLimit to allow PL2 bursts, unless VRM is overheating
+          if (vrmTemp <= PWM_THERMAL_WARNING) {
+            currentLimit = pl2;
+          }
+          targetWatts = pl2 * currentBurstMultiplier;
+          targetFreq = cpu.maxTurbo * currentBurstMultiplier;
+        } else {
+          // 3% chance per second to trigger a sudden burst charge
+          if (Math.random() < 0.03) {
+            burstTimer = Math.floor(Math.random() * 4) + 2; // 2 to 5 seconds
+            currentBurstMultiplier = 0.85 + Math.random() * 0.15; // 85% to 100% of PL2
+          }
+          
+          // Irregular base fluctuation using prime-based sine waves and larger random jitter
+          const wave1 = Math.sin(t / 3.1) * 0.10;
+          const wave2 = Math.sin(t / 7.3) * 0.15;
+          const wave3 = Math.sin(t / 11.7) * 0.05;
+          const jitter = (Math.random() - 0.5) * 0.20; // 20% random jitter
+          
+          const noiseFactor = 1.0 + wave1 + wave2 + wave3 + jitter;
+          
+          targetWatts = scenario.targetWatts * noiseFactor;
+          targetFreq = scenario.targetFreq * noiseFactor;
+        }
+        
+        // Clamp to realistic bounds
+        targetWatts = Math.min(currentLimit, Math.max(3, targetWatts));
+        targetFreq = Math.min(cpu.maxTurbo, Math.max(0.8, targetFreq));
+      }
+      
+      // Calculate thermal dynamics
+      const saturationPenalty = targetWatts > CHASSIS_TDP_LIMIT ? (targetWatts - CHASSIS_TDP_LIMIT) * 0.5 : 0;
+      const steadyStateTemp = ambientTemp + (targetWatts * currentThermalResistance) + saturationPenalty - uvReduction;
+      
+      // Thermal mass factor (how fast it heats up/cools down)
+      currentTemp = currentTemp + (steadyStateTemp - currentTemp) * 0.05;
+      
+      let actualWatts = targetWatts;
+      let actualFreq = targetFreq;
+      
+      if (currentTemp > TJUNCTION) {
+        currentTemp = TJUNCTION;
+        // Back-calculate allowed watts
+        const allowedRise = TJUNCTION - ambientTemp + uvReduction - saturationPenalty;
+        actualWatts = allowedRise / currentThermalResistance;
+        const throttleFactor = Math.max(0.3, actualWatts / targetWatts);
+        actualFreq = targetFreq * throttleFactor;
+      }
+      
+      // IccMax Throttle
+      let baseVAt800 = 0.650;
+      if (cpu.architecture === "Skylake") baseVAt800 = 0.670;
+      if (cpu.architecture === "Kaby Lake-R") baseVAt800 = 0.630;
+      const baseV = baseVAt800 + (actualFreq - 0.8) * 0.171;
+      const tempAdjustment = Math.max(0, (currentTemp - 50) * 0.0008);
+      const vDroop = (actualWatts * 0.0012);
+      const voltage = baseV + (vccCoreOffset / 1000) + tempAdjustment - vDroop;
+      
+      let amperage = (actualWatts / voltage) * archMultiplier;
+      
+      if (amperage > iccMax) {
+        const throttle = iccMax / amperage;
+        actualWatts *= throttle;
+        actualFreq *= throttle;
+        amperage = iccMax;
+      }
+      
+      // VRM Thermal Simulation
+      // Efficiency drops significantly at high loads and high temperatures
+      const baseEfficiency = Math.max(0.65, 0.92 - Math.pow(amperage / 35, 2) * 0.15);
+      const tempPenalty = Math.max(0, (vrmTemp - 80) * 0.002); // Efficiency drops above 80C
+      const efficiency = Math.max(0.5, baseEfficiency - tempPenalty);
+      
+      const vrmPowerLoss = actualWatts * ((1 / efficiency) - 1);
+      
+      // Incidental Airflow Model:
+      // The CPU fan spins faster as CPU temperature increases, pulling air over the PCB.
+      // Fan curve proxy: <45C = 0% fan, 80C+ = 100% fan effect on VRM.
+      const fanAirflowFactor = Math.max(0, Math.min(1.0, (currentTemp - 45) / 35.0)); 
+      
+      // Base ThetaJA is 22 (still air). With max incidental airflow, it drops significantly (e.g., by 45%).
+      const airflowCoolingBenefit = 1.0 - (fanAirflowFactor * 0.45); 
+      
+      // Apply cooling solution bonus (better fans/mods move more air)
+      const coolingModBonus = (coolingSolution === 'stock' ? 1.0 : 0.85);
+      
+      const vrmThetaJA = PWM_THETA_JA * airflowCoolingBenefit * coolingModBonus; 
+      
+      const vrmSteadyState = VRM_AMBIENT + (vrmPowerLoss * vrmThetaJA);
+      vrmTemp = vrmTemp + (vrmSteadyState - vrmTemp) * 0.02; // VRM heats up slower than CPU
+
+      if (vrmTemp > PWM_THERMAL_SHUTDOWN) {
+        isVrmShutdown = true;
+        actualWatts = 0;
+        actualFreq = 0;
+      }
+      
+      if (t % step === 0 || t === durationSeconds) {
+        data.push({
+          time: t,
+          temperature: Math.round(currentTemp),
+          vrmTemp: Math.round(vrmTemp),
+          power: Number(actualWatts.toFixed(1)),
+          frequency: Number(actualFreq.toFixed(2)),
+        });
+      }
+    }
+    return data;
+  }, [selectedCpu, vccCoreOffset, pl1, pl2, iccMax, tau, coolingSolution, airjetCount, acpiPpcLimit, scenarios, simulationScenario, simulationDuration]);
+
+  // Electrical System Analysis (Top level for UI access)
+  // X270 uses 1x 81382 GEJI (35A) for VCCCPUCORE and 1x 81382 GEJI for VCCGPUCore
+  const vrmLoad = useMemo(() => {
+    // Find the maximum amperage across all calculated scenarios
+    const maxAmperage = scenarios.length > 0 ? Math.max(...scenarios.map(s => s.amperage)) : 0;
+    
+    const designLimit = 35; // 81382 GEJI is a 35A part
+    return (maxAmperage / designLimit) * 100; // % of design limit
+  }, [scenarios]);
 
   return (
     <div className="min-h-screen bg-[#E4E3E0] text-[#141414] font-sans p-4 md:p-8">
-      <div className="max-w-[1400px] mx-auto">
+      <div className="max-w-[1860px] mx-auto">
         {/* Header */}
         <header className="mb-12 border-b border-[#141414] pb-6 flex flex-col md:flex-row md:items-end justify-between gap-4">
           <div>
@@ -494,136 +916,183 @@ export default function App() {
             </section>
 
             <section className="bg-white p-6 border border-[#141414] shadow-[4px_4px_0px_0px_rgba(20,20,20,1)]">
-              <div className="flex items-center justify-between mb-6">
-                <label className="block font-mono text-[10px] uppercase opacity-50">Voltage Control</label>
-                <div className="flex items-center gap-2">
-                  <span className="text-[10px] font-mono uppercase opacity-50">Sync</span>
-                  <button 
-                    onClick={toggleSync}
-                    className={`w-8 h-4 rounded-full relative transition-colors ${isSynchronous ? 'bg-blue-600' : 'bg-gray-300'}`}
-                  >
-                    <motion.div 
-                      animate={{ x: isSynchronous ? 16 : 2 }}
-                      className="absolute top-1 w-2 h-2 bg-white rounded-full"
-                    />
-                  </button>
-                </div>
-              </div>
-
-              <div className="space-y-8">
-                <div>
-                  <div className="flex justify-between mb-2">
-                    <span className="text-xs font-bold uppercase">VCC Core</span>
-                    <span className="font-mono text-xs text-blue-600">{vccCoreOffset} mV</span>
-                  </div>
-                  <input 
-                    type="range" 
-                    min={coreSafetyLimit} 
-                    max="0" 
-                    step="5"
-                    value={vccCoreOffset}
-                    onChange={(e) => handleCoreChange(Number(e.target.value))}
-                    className="w-full h-1 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-[#141414]"
-                  />
-                </div>
-
-                <div>
-                  <div className="flex justify-between mb-2">
-                    <span className="text-xs font-bold uppercase">VCC Cache</span>
-                    <span className="font-mono text-xs text-blue-600">{vccCacheOffset} mV</span>
-                  </div>
-                  <input 
-                    type="range" 
-                    min={cacheSafetyLimit} 
-                    max="0" 
-                    step="5"
-                    value={vccCacheOffset}
-                    onChange={(e) => handleCacheChange(Number(e.target.value))}
-                    className="w-full h-1 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-[#141414]"
-                  />
-                </div>
-              </div>
-
-              <div className="mt-8 pt-6 border-t border-gray-100">
-                <div className="flex items-center justify-between mb-4">
-                  <label className="block font-mono text-[10px] uppercase opacity-50">Live Vcc Estimates</label>
-                  <Activity className="w-3 h-3 text-blue-500" />
-                </div>
-                
-                <div className="grid grid-cols-2 gap-4">
-                  <div className="p-3 bg-gray-50 border border-gray-100">
-                    <div className="text-[10px] uppercase font-bold text-gray-400 mb-1">Idle (0.8GHz)</div>
-                    <div className="font-mono text-sm font-bold text-[#141414]">
-                      {(0.65 + (vccCoreOffset / 1000)).toFixed(3)} V
-                    </div>
-                  </div>
-                  <div className="p-3 bg-gray-50 border border-gray-100">
-                    <div className="text-[10px] uppercase font-bold text-gray-400 mb-1">Turbo ({selectedCpu.maxTurbo}GHz)</div>
-                    <div className="font-mono text-sm font-bold text-blue-600">
-                      {(0.65 + (selectedCpu.maxTurbo - 0.8) * 0.171 + (vccCoreOffset / 1000)).toFixed(3)} V
-                    </div>
-                  </div>
-                </div>
-                
-              <div className="mt-4 flex flex-col gap-2">
-                <div className="flex items-center gap-2 text-[9px] font-mono text-gray-500 uppercase tracking-tighter">
-                  <div className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse" />
-                  Stability Threshold: ~1.050V @ Turbo
-                </div>
-                <div className="flex items-center gap-2 text-[9px] font-mono text-blue-500 uppercase tracking-tighter">
-                  <ShieldAlert className="w-3 h-3" />
-                  Cache Safety: {cacheSafetyLimit}mV (Secure)
-                </div>
-                <div className="flex items-center gap-2 text-[9px] font-mono text-purple-500 uppercase tracking-tighter">
-                  <Zap className="w-3 h-3" />
-                  Core Rail: Unlocked (-225mV)
-                </div>
-              </div>
-              </div>
-
-              <div className="mt-6 p-3 bg-blue-50 border border-blue-100 rounded text-[10px] text-blue-800 leading-tight">
-                Undervolting reduces power draw, allowing higher sustained clocks within the 15W TDP limit.
-              </div>
-            </section>
-
-            <section className="bg-white p-6 border border-[#141414] shadow-[4px_4px_0px_0px_rgba(20,20,20,1)]">
-              <label className="block font-mono text-[10px] uppercase opacity-50 mb-6">Power Limits (PL1/PL2)</label>
+              <label className="block font-mono text-[10px] uppercase opacity-50 mb-6">XTU Parameters</label>
               
-              <div className="space-y-8">
-                <div>
-                  <div className="flex justify-between mb-2">
-                    <span className="text-xs font-bold uppercase">PL1 (Long Term)</span>
-                    <span className="font-mono text-xs text-cyan-600">{pl1} W</span>
+              {/* Voltage Control Subcategory */}
+              <div className="mb-8">
+                <div className="flex items-center justify-between mb-4">
+                  <h3 className="font-mono text-[10px] uppercase font-bold tracking-widest">Voltage Control</h3>
+                  <div className="flex items-center gap-2">
+                    <span className="text-[10px] font-mono uppercase opacity-50">Sync</span>
+                    <button 
+                      onClick={toggleSync}
+                      className={`w-8 h-4 rounded-full relative transition-colors ${isSynchronous ? 'bg-blue-600' : 'bg-gray-300'}`}
+                    >
+                      <motion.div 
+                        animate={{ x: isSynchronous ? 16 : 2 }}
+                        className="absolute top-1 w-2 h-2 bg-white rounded-full"
+                      />
+                    </button>
                   </div>
-                  <input 
-                    type="range" 
-                    min="5" 
-                    max="45" 
-                    step="1"
-                    value={pl1}
-                    onChange={(e) => setPl1(Number(e.target.value))}
-                    className="w-full h-1 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-cyan-600"
-                  />
                 </div>
 
-                <div>
-                  <div className="flex justify-between mb-2">
-                    <span className="text-xs font-bold uppercase">PL2 (Short Term)</span>
-                    <span className="font-mono text-xs text-cyan-600">{pl2} W</span>
+                <div className="space-y-6">
+                  <div>
+                    <div className="flex justify-between mb-2">
+                      <span className="text-xs font-bold uppercase">VCC Core</span>
+                      <span className="font-mono text-xs text-blue-600">{vccCoreOffset} mV</span>
+                    </div>
+                    <input 
+                      type="range" 
+                      min={coreSafetyLimit} 
+                      max="0" 
+                      step="5"
+                      value={vccCoreOffset}
+                      onChange={(e) => handleCoreChange(Number(e.target.value))}
+                      className="w-full h-1 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-[#141414]"
+                    />
                   </div>
-                  <input 
-                    type="range" 
-                    min="10" 
-                    max="60" 
-                    step="1"
-                    value={pl2}
-                    onChange={(e) => setPl2(Number(e.target.value))}
-                    className="w-full h-1 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-cyan-600"
-                  />
+
+                  <div>
+                    <div className="flex justify-between mb-2">
+                      <span className="text-xs font-bold uppercase">VCC Cache</span>
+                      <span className="font-mono text-xs text-blue-600">{vccCacheOffset} mV</span>
+                    </div>
+                    <input 
+                      type="range" 
+                      min={cacheSafetyLimit} 
+                      max="0" 
+                      step="5"
+                      value={vccCacheOffset}
+                      onChange={(e) => handleCacheChange(Number(e.target.value))}
+                      className="w-full h-1 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-[#141414]"
+                    />
+                  </div>
+                </div>
+
+                <div className="mt-6 pt-6 border-t border-gray-100">
+                  <div className="flex items-center justify-between mb-4">
+                    <label className="block font-mono text-[10px] uppercase opacity-50">Live Vcc Estimates</label>
+                    <Activity className="w-3 h-3 text-blue-500" />
+                  </div>
+                  
+                  <div className="grid grid-cols-2 gap-4">
+                    <div className="p-3 bg-gray-50 border border-gray-100">
+                      <div className="text-[10px] uppercase font-bold text-gray-400 mb-1">Idle (0.8GHz)</div>
+                      <div className="font-mono text-sm font-bold text-[#141414]">
+                        {(0.65 + (vccCoreOffset / 1000)).toFixed(3)} V
+                      </div>
+                    </div>
+                    <div className="p-3 bg-gray-50 border border-gray-100">
+                      <div className="text-[10px] uppercase font-bold text-gray-400 mb-1">Turbo ({selectedCpu.maxTurbo}GHz)</div>
+                      <div className="font-mono text-sm font-bold text-blue-600">
+                        {(0.65 + (selectedCpu.maxTurbo - 0.8) * 0.171 + (vccCoreOffset / 1000)).toFixed(3)} V
+                      </div>
+                    </div>
+                  </div>
+                  
+                  <div className="mt-4 flex flex-col gap-2">
+                    <div className="flex items-center gap-2 text-[9px] font-mono text-gray-500 uppercase tracking-tighter">
+                      <div className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse" />
+                      Stability Threshold: ~1.050V @ Turbo
+                    </div>
+                    <div className="flex items-center gap-2 text-[9px] font-mono text-blue-500 uppercase tracking-tighter">
+                      <ShieldAlert className="w-3 h-3" />
+                      Cache Safety: {cacheSafetyLimit}mV (Secure)
+                    </div>
+                    <div className="flex items-center gap-2 text-[9px] font-mono text-purple-500 uppercase tracking-tighter">
+                      <Zap className="w-3 h-3" />
+                      Core Rail: Unlocked (-225mV)
+                    </div>
+                  </div>
                 </div>
               </div>
-              <div className="mt-6 p-3 bg-cyan-50 border border-cyan-100 rounded text-[10px] text-cyan-800 leading-tight">
-                Increasing PL1 allows higher sustained clocks but increases heat. PL2 governs short-term burst peaks.
+
+              {/* Power Limits Subcategory */}
+              <div className="pt-6 border-t border-gray-200">
+                <h3 className="font-mono text-[10px] uppercase font-bold tracking-widest mb-4">Power Limits (PL1/PL2)</h3>
+                
+                <div className="space-y-6">
+                  <div>
+                    <div className="flex justify-between mb-2">
+                      <span className="text-xs font-bold uppercase">PL1 (Long Term)</span>
+                      <span className="font-mono text-xs text-cyan-600">{pl1} W</span>
+                    </div>
+                    <input 
+                      type="range" 
+                      min="5" 
+                      max="45" 
+                      step="1"
+                      value={pl1}
+                      onChange={(e) => setPl1(Number(e.target.value))}
+                      className="w-full h-1 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-cyan-600"
+                    />
+                  </div>
+
+                  <div>
+                    <div className="flex justify-between mb-2">
+                      <span className="text-xs font-bold uppercase">PL2 (Short Term)</span>
+                      <span className="font-mono text-xs text-cyan-600">{pl2} W</span>
+                    </div>
+                    <input 
+                      type="range" 
+                      min="10" 
+                      max="60" 
+                      step="1"
+                      value={pl2}
+                      onChange={(e) => setPl2(Number(e.target.value))}
+                      className="w-full h-1 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-cyan-600"
+                    />
+                  </div>
+                  
+                  <div>
+                    <div className="flex justify-between mb-2">
+                      <span className="text-xs font-bold uppercase">IccMax (Core Current)</span>
+                      <span className="font-mono text-xs text-cyan-600">{iccMax} A</span>
+                    </div>
+                    <input 
+                      type="range" 
+                      min="10" 
+                      max="60" 
+                      step="1"
+                      value={iccMax}
+                      onChange={(e) => setIccMax(Number(e.target.value))}
+                      className="w-full h-1 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-cyan-600"
+                    />
+                  </div>
+
+                  <div>
+                    <div className="flex justify-between mb-2">
+                      <span className="text-xs font-bold uppercase">ACPI PPC Limit</span>
+                      <span className="font-mono text-xs text-cyan-600">{acpiPpcLimit} %</span>
+                    </div>
+                    <input 
+                      type="range" 
+                      min="50" 
+                      max="100" 
+                      step="1"
+                      value={acpiPpcLimit}
+                      onChange={(e) => setAcpiPpcLimit(Number(e.target.value))}
+                      className="w-full h-1 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-cyan-600"
+                    />
+                  </div>
+
+                  <div>
+                    <div className="flex justify-between mb-2">
+                      <span className="text-xs font-bold uppercase">Tau (Turbo Time)</span>
+                      <span className="font-mono text-xs text-cyan-600">{tau} s</span>
+                    </div>
+                    <input 
+                      type="range" 
+                      min="1" 
+                      max="96" 
+                      step="1"
+                      value={tau}
+                      onChange={(e) => setTau(Number(e.target.value))}
+                      className="w-full h-1 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-cyan-600"
+                    />
+                  </div>
+                </div>
               </div>
             </section>
 
@@ -731,18 +1200,16 @@ export default function App() {
                   )}
                 </div>
               </div>
-              
-              <div className="mt-6 p-3 bg-gray-50 border border-gray-100 rounded text-[10px] text-gray-600 leading-tight italic">
-                Note: Selecting a modded solution replaces the stock thermal management. Only one primary cooling mod can be active at a time.
-              </div>
             </section>
+
+
           </div>
 
           {/* Main Table */}
           <div className="lg:col-span-2">
             <div className="bg-white border border-[#141414] shadow-[8px_8px_0px_0px_rgba(20,20,20,1)] overflow-hidden">
-              <div className="grid grid-cols-7 md:grid-cols-11 p-4 border-b border-[#141414] bg-[#141414] text-white font-mono text-xs uppercase tracking-widest">
-                <div className="col-span-1 md:col-span-2">Scenario</div>
+              <div className="grid grid-cols-7 md:grid-cols-[1.8fr_1fr_1fr_0.9fr_1fr_1fr_1fr_1fr_2fr] p-4 border-b border-[#141414] bg-[#141414] text-white font-mono text-xs uppercase tracking-widest">
+                <div className="col-span-1">Scenario</div>
                 <div className="text-center hidden md:block">Max Freq</div>
                 <div className="text-center">Sustained</div>
                 <div className="text-center">Power</div>
@@ -750,7 +1217,7 @@ export default function App() {
                 <div className="text-center">Voltage</div>
                 <div className="text-center">Amps</div>
                 <div className="text-center">Status</div>
-                <div className="text-right col-span-1 md:col-span-2">Reason</div>
+                <div className="text-right col-span-1">Reason</div>
               </div>
 
               <div className="divide-y divide-[#141414]">
@@ -760,9 +1227,9 @@ export default function App() {
                     initial={{ opacity: 0, x: 20 }}
                     animate={{ opacity: 1, x: 0 }}
                     transition={{ delay: idx * 0.1 }}
-                    className="grid grid-cols-7 md:grid-cols-11 p-4 md:p-6 items-center hover:bg-gray-50 transition-colors group"
+                    className="grid grid-cols-7 md:grid-cols-[1.8fr_1fr_1fr_0.9fr_1fr_1fr_1fr_1fr_2fr] p-4 md:p-6 items-center hover:bg-gray-50 transition-colors group"
                   >
-                    <div className="col-span-1 md:col-span-2 flex items-start gap-4">
+                    <div className="col-span-1 flex items-start gap-4">
                       <div className="mt-1 p-2 bg-gray-100 group-hover:bg-white border border-transparent group-hover:border-[#141414] transition-all">
                         {scenario.icon}
                       </div>
@@ -788,12 +1255,13 @@ export default function App() {
                       <span className="font-mono text-xs font-bold text-orange-600">{scenario.tempRange}</span>
                     </div>
 
-                    <div className="text-center">
+                    <div className="text-center flex flex-col items-center justify-center">
                       <span className="font-mono text-sm font-bold text-red-600">{scenario.voltage}</span>
+                      <span className="font-mono text-[9px] text-gray-400 mt-0.5">{scenario.safetyRange}</span>
                     </div>
 
                     <div className="text-center">
-                      <span className={`font-mono text-sm font-bold ${scenario.amperage > 25 ? 'text-red-600' : 'text-gray-700'}`}>
+                      <span className={`font-mono text-sm font-bold ${scenario.amperage > 35 ? 'text-red-600' : scenario.amperage > 28 ? 'text-orange-600' : 'text-gray-700'}`}>
                         {scenario.amperage.toFixed(1)}A
                       </span>
                     </div>
@@ -807,12 +1275,16 @@ export default function App() {
                         >
                           CRASH
                         </motion.span>
+                      ) : scenario.isThrottled ? (
+                        <span className="font-mono text-[10px] font-bold text-orange-600 bg-orange-50 px-2 py-1 border border-orange-200 uppercase tracking-tighter">
+                          EDP Throttled
+                        </span>
                       ) : (
                         <span className="font-mono text-xs font-bold text-green-600 opacity-50 uppercase tracking-tighter">Stable</span>
                       )}
                     </div>
 
-                    <div className="text-right col-span-1 md:col-span-2">
+                    <div className="text-right col-span-1">
                       <span className="font-mono text-[10px] text-gray-500 italic">
                         {scenario.isCrashed ? scenario.crashReason : "—"}
                       </span>
@@ -851,7 +1323,7 @@ export default function App() {
                     <span className="font-bold block mb-1 uppercase tracking-tighter">Electrical Analysis</span>
                     <div className="flex justify-between mb-1">
                       <span>VRM Peak Load:</span>
-                      <span className="font-mono">{vrmLoad.toFixed(1)}%</span>
+                      <span className="font-mono">{vrmLoad.toFixed(1)}% (of 35A)</span>
                     </div>
                     <div className="flex justify-between mb-1">
                       <span>Current Limit Risk:</span>
@@ -861,7 +1333,7 @@ export default function App() {
                     </div>
                     {vrmLoad > 100 && (
                       <p className="opacity-80">
-                        Warning: PL2 exceeds VRM specs (~25A). EDP throttling likely.
+                        Warning: PL2 pushes the single-phase 81382 GEJI VRM near its 35A limit. EDP throttling or OCP shutdown likely.
                       </p>
                     )}
                   </div>
@@ -922,6 +1394,138 @@ export default function App() {
                 </div>
               </div>
             </section>
+          </div>
+        </div>
+
+        {/* Stress Test Graph */}
+        <div className="mt-8 bg-white border border-[#141414] shadow-[8px_8px_0px_0px_rgba(20,20,20,1)] p-6">
+          <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-6">
+            <div className="flex items-center gap-2">
+              <Activity className="w-5 h-5" />
+              <h3 className="font-mono text-sm uppercase tracking-wider font-bold">Stress Test Simulation</h3>
+            </div>
+            
+            <div className="flex flex-col sm:flex-row gap-4">
+              <div className="flex items-center gap-2">
+                <label className="font-mono text-[10px] uppercase opacity-50">Scenario:</label>
+                <select 
+                  value={simulationScenario}
+                  onChange={(e) => setSimulationScenario(e.target.value)}
+                  className="bg-gray-50 border border-gray-200 text-xs font-mono p-1.5 rounded focus:outline-none focus:border-[#141414]"
+                >
+                  {scenarios.map(s => (
+                    <option key={s.name} value={s.name}>{s.name}</option>
+                  ))}
+                </select>
+              </div>
+              
+              <div className="flex items-center gap-2">
+                <label className="font-mono text-[10px] uppercase opacity-50">Duration:</label>
+                <input 
+                  type="range" 
+                  min="4" 
+                  max="150" 
+                  step="1"
+                  value={simulationDuration}
+                  onChange={(e) => setSimulationDuration(Number(e.target.value))}
+                  className="w-24 h-1 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-[#141414]"
+                />
+                <span className="font-mono text-xs font-bold w-12 text-right">{simulationDuration}m</span>
+              </div>
+            </div>
+          </div>
+          <div className="h-[400px] w-full">
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={stressTestData} margin={{ top: 5, right: 30, left: 20, bottom: 5 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />
+                <XAxis 
+                  dataKey="time" 
+                  tickFormatter={(val) => {
+                    const m = Math.floor(val / 60);
+                    const s = val % 60;
+                    return m > 0 ? (s === 0 ? `${m}m` : `${m}m ${s}s`) : `${s}s`;
+                  }} 
+                  stroke="#6b7280" 
+                  fontSize={12} 
+                  tickMargin={10}
+                />
+                <YAxis 
+                  yAxisId="temp" 
+                  domain={[30, 150]} 
+                  stroke="#ea580c" 
+                  fontSize={12}
+                  tickFormatter={(val) => `${val}°C`}
+                />
+                <YAxis 
+                  yAxisId="power" 
+                  orientation="right" 
+                  domain={[0, 60]} 
+                  stroke="#0284c7" 
+                  fontSize={12}
+                  tickFormatter={(val) => `${val}W`}
+                />
+                <Tooltip 
+                  contentStyle={{ backgroundColor: '#141414', color: '#fff', border: 'none', borderRadius: '4px' }}
+                  itemStyle={{ fontSize: '12px', fontFamily: 'monospace' }}
+                  labelStyle={{ fontSize: '12px', color: '#9ca3af', marginBottom: '4px' }}
+                  formatter={(value: number, name: string) => {
+                    if (name === 'temperature') return [`${value}°C`, 'CPU Temperature'];
+                    if (name === 'vrmTemp') return [`${value}°C`, 'VRM Temperature'];
+                    if (name === 'power') return [`${value}W`, 'Package Power'];
+                    if (name === 'frequency') return [`${value}GHz`, 'Core Clock'];
+                    return [value, name];
+                  }}
+                  labelFormatter={(label) => {
+                    const m = Math.floor(Number(label) / 60);
+                    const s = Number(label) % 60;
+                    const timeStr = m > 0 ? `${m}m ${s}s` : `${s}s`;
+                    return `Time: ${timeStr}`;
+                  }}
+                />
+                <Legend wrapperStyle={{ fontSize: '12px', fontFamily: 'monospace', paddingTop: '20px' }} />
+                <Line 
+                  yAxisId="temp" 
+                  type="monotone" 
+                  dataKey="temperature" 
+                  name="temperature" 
+                  stroke="#ea580c" 
+                  strokeWidth={2} 
+                  dot={false} 
+                  isAnimationActive={false}
+                />
+                <Line 
+                  yAxisId="temp" 
+                  type="monotone" 
+                  dataKey="vrmTemp" 
+                  name="vrmTemp" 
+                  stroke="#dc2626" 
+                  strokeWidth={2} 
+                  strokeDasharray="5 5"
+                  dot={false} 
+                  isAnimationActive={false}
+                />
+                <Line 
+                  yAxisId="power" 
+                  type="stepAfter" 
+                  dataKey="power" 
+                  name="power" 
+                  stroke="#0284c7" 
+                  strokeWidth={2} 
+                  dot={false} 
+                  isAnimationActive={false}
+                />
+                <Line 
+                  yAxisId="power" 
+                  type="monotone" 
+                  dataKey="frequency" 
+                  name="frequency" 
+                  stroke="#8b5cf6" 
+                  strokeWidth={2} 
+                  dot={false} 
+                  isAnimationActive={false}
+                />
+              </LineChart>
+            </ResponsiveContainer>
           </div>
         </div>
 

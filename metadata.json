@@ -1,5 +1,5 @@
 {
   "name": "X270 CPU Simulator",
-  "description": "A technical simulation of BGA 1356 CPU behavior in the ThinkPad X270 chassis across various workload scenarios.",
+  "description": "Simulation of the behavior of any and all BGA1356 CPU's in the XX270 chassis. A tool made to improve chances of success on a thinkpad quad core mod on this platform.",
   "requestFramePermissions": []
 }
